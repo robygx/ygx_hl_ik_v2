@@ -1,0 +1,67 @@
+# PiM-IK .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+*.ckpt
+
+# 训练输出 (保留模型 checkpoints)
+checkpoints/**/*.pth
+!checkpoints/*/best_model.pth
+
+# 数据集 (太大，不上传)
+*.npz
+data/
+# 允许 Pinocchio 模型
+!g1_left_arm_model_cache.pkl
+*.pickle
+
+# 日志
+wandb/
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# CUDA
+*.cu.o
+*.ptx
+
+# 临时文件
+tmp/
+temp/
+*.tmp
