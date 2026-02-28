@@ -526,9 +526,10 @@ def main():
 
     args = parser.parse_args()
 
-    # 自动生成输出文件名
+    # 自动生成输出文件名 (保存到 evaluation/ 目录)
     if args.output is None:
-        args.output = f'/home/ygx/ygx_hl_ik_v2/evaluation_results_{args.experiment}.json'
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        args.output = f'/home/ygx/ygx_hl_ik_v2/evaluation/{args.experiment}_{timestamp}.json'
 
     print("=" * 120)
     print("PiM-IK 综合评估 (遵循全局评估标准)")
