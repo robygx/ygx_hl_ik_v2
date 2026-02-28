@@ -31,13 +31,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-# Pinocchio 导入 (需要 numpy < 2.0)
+# Pinocchio 导入 (可选依赖，用于 HierarchicalIKSolver)
+PINOCCHIO_AVAILABLE = False
 try:
     import pinocchio as pin
+    PINOCCHIO_AVAILABLE = True
 except ImportError as e:
-    print(f"Error importing pinocchio: {e}")
-    print("Please install: pip install pinocchio 'numpy<2.0'")
-    sys.exit(1)
+    print(f"[Warning] pinocchio 未安装 (仅影响 HierarchicalIKSolver): {e}")
+    print("[Info] TargetGenerator 不依赖 pinocchio，可正常使用")
 
 # 导入自定义模块
 from pim_ik_net import PiM_IK_Net

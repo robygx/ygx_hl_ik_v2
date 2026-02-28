@@ -65,3 +65,71 @@ Thumbs.db
 tmp/
 temp/
 *.tmp
+
+# ========== 新增：系统用户配置目录 ==========
+# 用户 Shell 配置
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.zshrc
+.lesshst
+.viminfo
+.gitconfig
+.netrc
+
+# 用户目录
+.anaconda/
+.conda/
+.cache/
+.config/
+.local/
+.ssh/
+.python_history
+.u2net/
+.codex/
+.claude/
+.copilot/
+.cursor/
+.gemini/
+.libero/
+.mujoco/
+.nv/
+.rustup/
+.sapien/
+.vscode-server/
+.fontconfig/
+.dotnet/
+.cursor-server/
+.antigravity-server/
+.snap/
+.sudo_as_admin_successful
+
+# 其他系统文件
+.Xauthority
+.wget-hsts
+
+# ========== 新增：第三方项目/数据 ==========
+# 其他项目（独立 Git 仓库）
+IK/
+Locomotion/
+VLA/
+VR/
+VR_data_any/
+hl_ik_xr_tele/
+
+# Claude 技能
+claude-skills/
+
+# 大型压缩文件
+*.zip
+*.tar.gz
+*.7z
+
+# 可视化输出（可选，根据需要注释）
+# *.png
+# *.jpg
+
+# ========== 新增：特定文件 ==========
+# 评估结果JSON（大文件，不上传）
+evaluation_results.json

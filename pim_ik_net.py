@@ -144,19 +144,20 @@ class PiM_IK_Net(nn.Module):
     """
     物理内化 Mamba 逆运动学网络
 
-    使用 Mamba 架构处理时序末端位姿数据，预测连续臂角 [cos(φ), sin(φ)]
+    使用 Mamba/LSTM/Transformer 架构处理时序末端位姿数据，预测连续臂角 [cos(φ), sin(φ)]
 
     网络结构:
     1. Stem: 浅层特征映射 (Linear + Conv1d + GELU)
-    2. Backbone: 堆叠的 Mamba 块 (带残差连接)
+    2. Backbone: 堆叠的 Mamba 块 / 单向 LSTM / Causal Transformer (带残差连接)
     3. Output Head: 意图解码 MLP + L2 归一化
 
     Args:
         d_model: 模型隐空间维度（默认 256）
-        num_layers: Mamba 堆叠层数（默认 4）
+        num_layers: 骨干网络堆叠层数（默认 4）
         d_state: Mamba SSM 状态维度（默认 16）
         d_conv: Mamba 卷积核大小（默认 4）
         expand: Mamba 扩展因子（默认 2）
+        backbone_type: 骨干网络类型，可选 'mamba'/'lstm'/'transformer'（默认 'mamba'）
     """
 
     def __init__(
@@ -166,11 +167,13 @@ class PiM_IK_Net(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        backbone_type: str = 'mamba',
     ):
         super().__init__()
 
         self.d_model = d_model
         self.num_layers = num_layers
+        self.backbone_type = backbone_type
 
         # ================================================================
         # 1. Stem: 浅层特征映射
@@ -193,17 +196,50 @@ class PiM_IK_Net(nn.Module):
         self.stem_act = nn.GELU()
 
         # ================================================================
-        # 2. Backbone: Mamba 堆叠
+        # 2. Backbone: 根据 backbone_type 选择不同的骨干网络
         # ================================================================
-        self.mamba_blocks = nn.ModuleList([
-            MambaBlock(
-                d_model=d_model,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand
+        if backbone_type == 'mamba':
+            if not MAMBA_AVAILABLE:
+                raise ImportError("backbone_type='mamba' 需要 mamba_ssm，请运行: pip install mamba-ssm causal-conv1d")
+            self.mamba_blocks = nn.ModuleList([
+                MambaBlock(
+                    d_model=d_model,
+                    d_state=d_state,
+                    d_conv=d_conv,
+                    expand=expand
+                )
+                for _ in range(num_layers)
+            ])
+
+        elif backbone_type == 'lstm':
+            # 单向 LSTM，确保因果性（严禁使用 bidirectional=True）
+            self.lstm = nn.LSTM(
+                input_size=d_model,
+                hidden_size=d_model,
+                num_layers=num_layers,
+                batch_first=True
             )
-            for _ in range(num_layers)
-        ])
+
+        elif backbone_type == 'transformer':
+            # 可学习位置编码 (500 足以覆盖所有可能的窗口大小)
+            self.pos_embedding = nn.Parameter(torch.zeros(1, 500, d_model))
+            nn.init.trunc_normal_(self.pos_embedding, std=0.02)
+
+            # Causal Transformer 编码器
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=8,
+                dim_feedforward=d_model * 4,
+                batch_first=True,
+                norm_first=True  # Pre-LN: 训练更稳定，对齐现代 Transformer 标准
+            )
+            self.transformer = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers
+            )
+
+        else:
+            raise ValueError(f"不支持的 backbone_type: {backbone_type}，请选择 'mamba'/'lstm'/'transformer'")
 
         # ================================================================
         # 3. Output Head: 意图解码 MLP
@@ -226,6 +262,10 @@ class PiM_IK_Net(nn.Module):
         Returns:
             pred_swivel: (B, W, 2) 预测的臂角 [cos(φ), sin(φ)]
                          已归一化为单位向量（每个时间步）
+
+        Note:
+            当 W == 1 时，网络作为无时序记忆的 MLP 基线运行（跳过 Conv1d 和 Mamba）。
+            这是用于消融实验，验证时序建模的重要性。
         """
         B, W, _, _ = T_ee.shape
 
@@ -240,19 +280,51 @@ class PiM_IK_Net(nn.Module):
         # Linear 投影
         x = self.stem_linear(x)  # (B, W, d_model)
 
-        # Conv1d 时序平滑 (需要 permute)
-        x = x.permute(0, 2, 1)   # (B, d_model, W)
-        x = self.stem_conv(x)    # (B, d_model, W)
-        x = x.permute(0, 2, 1)   # (B, W, d_model)
-
-        # GELU 激活
-        x = self.stem_act(x)     # (B, W, d_model)
-
         # ================================================================
-        # Step 3: Backbone - Mamba 堆叠
+        # 【消融实验】条件分支：根据窗口大小决定是否使用时序组件
         # ================================================================
-        for mamba_block in self.mamba_blocks:
-            x = mamba_block(x)   # (B, W, d_model) with residual
+        if W == 1:
+            # ============================================================
+            # W=1: 无时序记忆基线 (消融实验用)
+            # 跳过 Conv1d 和 Mamba，直接通过 MLP
+            # 这代表一个纯粹的单帧推理网络，无法利用历史信息
+            # ============================================================
+            x = self.stem_act(x)  # (B, 1, d_model)
+        else:
+            # ============================================================
+            # W>1: 完整时序网络 (Conv1d + Mamba)
+            # ============================================================
+            # Conv1d 时序平滑 (需要 permute)
+            x = x.permute(0, 2, 1)   # (B, d_model, W)
+            x = self.stem_conv(x)    # (B, d_model, W)
+            x = x.permute(0, 2, 1)   # (B, W, d_model)
+
+            # GELU 激活
+            x = self.stem_act(x)     # (B, W, d_model)
+
+            # ============================================================
+            # Step 3: Backbone - 根据 backbone_type 路由
+            # ============================================================
+            if self.backbone_type == 'mamba':
+                # Mamba 堆叠
+                for mamba_block in self.mamba_blocks:
+                    x = mamba_block(x)   # (B, W, d_model) with residual
+
+            elif self.backbone_type == 'lstm':
+                # 单向 LSTM (因果性保证)
+                x, _ = self.lstm(x)  # (B, W, d_model)
+
+            elif self.backbone_type == 'transformer':
+                # 添加位置编码
+                x = x + self.pos_embedding[:, :W, :]
+
+                # 生成因果掩码 (防止未来信息泄露)
+                causal_mask = nn.Transformer.generate_square_subsequent_mask(
+                    W, device=x.device
+                )  # (W, W)
+
+                # 前向传播
+                x = self.transformer(x, mask=causal_mask, is_causal=True)
 
         # ================================================================
         # Step 4: Output Head - 全时间窗口解码

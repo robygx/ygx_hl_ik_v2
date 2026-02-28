@@ -33,6 +33,7 @@ pip install mamba-ssm causal-conv1d  # Mamba 依赖
 
 import os
 import sys
+import argparse
 from pathlib import Path
 from typing import Dict, Tuple
 from datetime import datetime
@@ -98,6 +99,70 @@ def setup() -> int:
 def cleanup():
     """销毁 DDP 分布式环境"""
     dist.destroy_process_group()
+
+
+def parse_args():
+    """
+    解析命令行参数
+
+    用于消融实验，支持不同窗口大小的训练
+
+    Returns:
+        args: 解析后的参数
+    """
+    parser = argparse.ArgumentParser(
+        description='PiM-IK 训练脚本 - 支持窗口长度消融实验',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # 数据相关
+    parser.add_argument('--data_path', type=str,
+                        default='/data0/wwb_data/ygx_data/data_ygx_pose+dof/ACCAD_CMU_merged_training_data_with_swivel.npz',
+                        help='训练数据路径 (.npz 文件)')
+    parser.add_argument('--window_size', type=int, default=30,
+                        choices=[1, 15, 30],
+                        help='时序窗口大小 (消融实验: 30=完整Mamba, 15=中等记忆, 1=无记忆基线)')
+
+    # 训练相关
+    parser.add_argument('--epochs', type=int, default=6,
+                        help='训练轮数')
+    parser.add_argument('--batch_size', type=int, default=512,
+                        help='每卡批次大小')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                        help='初始学习率')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                        help='权重衰减 (L2 正则化)')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                        help='学习率预热轮数')
+    parser.add_argument('--grad_clip', type=float, default=1.0,
+                        help='梯度裁剪最大范数')
+
+    # 模型相关
+    parser.add_argument('--d_model', type=int, default=256,
+                        help='Mamba 隐空间维度')
+    parser.add_argument('--num_layers', type=int, default=4,
+                        help='Mamba 堆叠层数')
+    parser.add_argument('--backbone', type=str, default='mamba',
+                        choices=['mamba', 'lstm', 'transformer'],
+                        help='骨干网络类型 (消融实验: mamba/lstm/transformer)')
+
+    # 保存与日志
+    parser.add_argument('--save_dir', type=str, default='./checkpoints',
+                        help='检查点保存目录')
+    parser.add_argument('--wandb_project', type=str, default='PiM-IK',
+                        help='WandB 项目名称')
+    parser.add_argument('--no_wandb', action='store_true',
+                        help='禁用 WandB 日志')
+
+    # 损失函数权重 (消融实验)
+    parser.add_argument('--w_swivel', type=float, default=1.0,
+                        help='拟人先验约束权重 L_swivel')
+    parser.add_argument('--w_elbow', type=float, default=1.0,
+                        help='三维空间约束权重 L_elbow')
+    parser.add_argument('--w_smooth', type=float, default=0.1,
+                        help='时序平滑惩罚权重 L_smooth')
+
+    return parser.parse_args()
 
 
 # ============================================================================
@@ -490,28 +555,39 @@ class CosineScheduleWithWarmup:
 
 def main():
     # ================================================================
-    # 超参数配置
+    # 解析命令行参数
+    # ================================================================
+    args = parse_args()
+
+    # ================================================================
+    # 超参数配置 (从命令行参数构建)
     # ================================================================
     CONFIG = {
         # 数据
-        'data_path': '/data0/wwb_data/ygx_data/data_ygx_pose+dof/ACCAD_CMU_merged_training_data_with_swivel.npz',
-        'window_size': 30,
+        'data_path': args.data_path,
+        'window_size': args.window_size,
 
         # 训练
-        'batch_size': 512,  # 每卡 batch size
-        'epochs': 100,
-        'lr': 1e-3,
-        'weight_decay': 1e-4,
-        'warmup_epochs': 5,
-        'grad_clip': 1.0,
+        'batch_size': args.batch_size,
+        'epochs': args.epochs,
+        'lr': args.lr,
+        'weight_decay': args.weight_decay,
+        'warmup_epochs': args.warmup_epochs,
+        'grad_clip': args.grad_clip,
 
         # 模型
-        'd_model': 256,
-        'num_layers': 4,
+        'd_model': args.d_model,
+        'num_layers': args.num_layers,
+        'backbone': args.backbone,
+
+        # 损失函数权重
+        'w_swivel': args.w_swivel,
+        'w_elbow': args.w_elbow,
+        'w_smooth': args.w_smooth,
 
         # 保存
-        'save_dir': './checkpoints',
-        'wandb_project': 'PiM-IK',
+        'save_dir': args.save_dir,
+        'wandb_project': args.wandb_project,
     }
 
     # ================================================================
@@ -524,21 +600,32 @@ def main():
     # ================================================================
     # WandB 初始化（仅 Rank 0）
     # ================================================================
-    if local_rank == 0:
-        wandb.init(
-            project=CONFIG['wandb_project'],
-            config=CONFIG,
-            name=f"PiM-IK-{wandb.util.generate_id()}"
-        )
-        print(f"[WandB] 初始化完成: {wandb.run.name}")
+    # 构建损失权重标识字符串 (用于 WandB 和保存目录命名)
+    loss_tag = f"sw{args.w_swivel}_el{args.w_elbow}_sm{args.w_smooth}"
+    # 构建骨干网络标识
+    backbone_tag = args.backbone
+    # 构建层数标识
+    layers_tag = f"L{args.num_layers}"
 
-        # 创建带时间戳的保存目录
+    if local_rank == 0:
+        if not args.no_wandb:
+            wandb.init(
+                project=CONFIG['wandb_project'],
+                config=CONFIG,
+                name=f"PiM-IK-{backbone_tag}-{layers_tag}-W{args.window_size}-{loss_tag}-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            print(f"[WandB] 初始化完成: {wandb.run.name}")
+        else:
+            print("[WandB] 已禁用 (使用 --no_wandb)")
+
+        # 创建带时间戳、骨干网络、层数、窗口大小和损失权重的保存目录
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        save_dir = os.path.join(CONFIG['save_dir'], timestamp)
+        save_dir = os.path.join(CONFIG['save_dir'], f"{backbone_tag}_{layers_tag}_W{args.window_size}_loss_{loss_tag}_{timestamp}")
         os.makedirs(save_dir, exist_ok=True)
         CONFIG['save_dir'] = save_dir  # 更新配置
 
         print(f"[Save] 检查点保存目录: {save_dir}")
+        print(f"[Config] 窗口大小: W={args.window_size}, 损失权重: swivel={args.w_swivel}, elbow={args.w_elbow}, smooth={args.w_smooth}")
 
     # ================================================================
     # 数据集与数据加载器
@@ -605,11 +692,14 @@ def main():
 
     model = PiM_IK_Net(
         d_model=CONFIG['d_model'],
-        num_layers=CONFIG['num_layers']
+        num_layers=CONFIG['num_layers'],
+        backbone_type=CONFIG['backbone']
     ).to(device)
 
     # DDP 包装
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    # find_unused_parameters=True 允许部分参数不参与梯度计算 (消融实验 W=1 时需要)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                find_unused_parameters=True)
 
     # 统计参数量
     if local_rank == 0:
@@ -640,11 +730,11 @@ def main():
             num_training_steps=total_steps
         )
 
-    # 损失函数
+    # 损失函数 (使用命令行参数配置权重)
     loss_fn = PhysicsInformedLoss(
-        w_swivel=1.0,
-        w_elbow=1.0,
-        w_smooth=0.1
+        w_swivel=CONFIG['w_swivel'],
+        w_elbow=CONFIG['w_elbow'],
+        w_smooth=CONFIG['w_smooth']
     ).to(device)
 
     # ================================================================
@@ -653,9 +743,12 @@ def main():
     if local_rank == 0:
         print(f"\n{'='*60}")
         print(f"[Train] 开始训练: {CONFIG['epochs']} epochs")
+        print(f"[Train] 策略: 最佳模型保存 + 每3轮无改善时强制保存")
         print(f"{'='*60}\n")
 
     best_val_loss = float('inf')
+    epochs_without_improvement = 0  # 记录连续无改善的轮数
+    SAVE_INTERVAL = 3  # 每3轮无改善时强制保存
 
     for epoch in range(CONFIG['epochs']):
         # 设置 sampler 的 epoch（确保每个 epoch 的 shuffle 不同）
@@ -702,37 +795,68 @@ def main():
             )
 
             # WandB 日志
-            wandb.log({
-                'epoch': epoch + 1,
-                'train/loss': train_metrics['loss'],
-                'train/swivel': train_metrics['swivel'],
-                'train/elbow': train_metrics['elbow'],
-                'train/smooth': train_metrics['smooth'],
-                'val/loss': val_metrics['loss'],
-                'val/swivel': val_metrics['swivel'],
-                'val/elbow': val_metrics['elbow'],
-                'val/smooth': val_metrics['smooth'],
-                'lr': current_lr
-            })
+            if not args.no_wandb:
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'train/loss': train_metrics['loss'],
+                    'train/swivel': train_metrics['swivel'],
+                    'train/elbow': train_metrics['elbow'],
+                    'train/smooth': train_metrics['smooth'],
+                    'val/loss': val_metrics['loss'],
+                    'val/swivel': val_metrics['swivel'],
+                    'val/elbow': val_metrics['elbow'],
+                    'val/smooth': val_metrics['smooth'],
+                    'lr': current_lr
+                })
 
-            # 保存最佳模型
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
-                save_path = os.path.join(CONFIG['save_dir'], 'best_model.pth')
+            # 保存检查点的辅助函数
+            def save_checkpoint(save_name, is_best=False):
+                save_path = os.path.join(CONFIG['save_dir'], save_name)
                 torch.save({
                     'epoch': epoch + 1,
                     'model_state_dict': model.module.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'val_loss': best_val_loss,
-                    'config': CONFIG
+                    'val_loss': val_metrics['loss'],
+                    'config': CONFIG,
+                    'window_size': args.window_size,
+                    'loss_weights': {
+                        'w_swivel': args.w_swivel,
+                        'w_elbow': args.w_elbow,
+                        'w_smooth': args.w_smooth
+                    },
+                    'args': vars(args)
                 }, save_path)
-                print(f"  -> 保存最佳模型: {save_path} (val_loss={best_val_loss:.4f})")
+                tag = "最佳模型" if is_best else "检查点"
+                print(f"  -> 保存{tag}: {save_path} (val_loss={val_metrics['loss']:.4f})")
+                return save_path
+
+            # 判断是否保存
+            if val_metrics['loss'] < best_val_loss:
+                # 有改善：保存为最佳模型
+                best_val_loss = val_metrics['loss']
+                epochs_without_improvement = 0
+                checkpoint_name = f'best_model_{args.backbone}_L{args.num_layers}_w{args.window_size}_{loss_tag}.pth'
+                save_checkpoint(checkpoint_name, is_best=True)
+            else:
+                # 无改善：计数+1
+                epochs_without_improvement += 1
+
+                # 每3轮无改善时强制保存一次
+                if epochs_without_improvement >= SAVE_INTERVAL:
+                    checkpoint_name = f'checkpoint_epoch{epoch+1}_{args.backbone}_L{args.num_layers}_w{args.window_size}_{loss_tag}.pth'
+                    save_checkpoint(checkpoint_name, is_best=False)
+                    epochs_without_improvement = 0  # 重置计数器
+
+                    # 如果已经保存了强制检查点且达到最大轮数，可以提前停止
+                    if epoch + 1 >= CONFIG['epochs']:
+                        print(f"  [Info] 达到最大轮数 {CONFIG['epochs']}，停止训练")
 
     # ================================================================
     # 训练完成
     # ================================================================
     if local_rank == 0:
-        wandb.finish()
+        if not args.no_wandb:
+            wandb.finish()
         print(f"\n{'='*60}")
         print(f"[Train] 训练完成! 最佳验证损失: {best_val_loss:.4f}")
         print(f"{'='*60}")
