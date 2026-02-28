@@ -151,6 +151,37 @@ T_mapped = retargeter.map_pose(T_vr)
 
 ## 消融实验
 
+### 综合评估脚本
+
+遵循全局评估标准，支持 5 个核心指标：
+
+```bash
+cd /home/ygx/ygx_hl_ik_v2
+
+# Loss 剥离实验
+python ablation/comprehensive_eval.py --experiment loss_ablation
+
+# 窗口大小实验
+python ablation/comprehensive_eval.py --experiment window_size_ablation
+
+# 骨干网络实验
+python ablation/comprehensive_eval.py --experiment backbone_ablation
+
+# 层数实验
+python ablation/comprehensive_eval.py --experiment layers_ablation
+```
+
+### 评估指标
+
+| 指标 | 单位 | 物理意义 |
+|------|------|----------|
+| Params | K | 模型参数量 |
+| Latency | ms | 推理延迟（要求 < 1ms） |
+| Swivel MAE | ° | 臂角预测精度 |
+| Elbow Error | mm | 肘部空间误差 |
+| Jerk | - | 动作平滑度（越低越好） |
+| Joint MAE | ° | 端到端关节角度误差 |
+
 ### 时序窗口消融
 
 ```bash
