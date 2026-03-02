@@ -46,8 +46,7 @@ for exp in "${!experiments[@]}"; do
         --data_path "$DATA_PATH" \
         --output "$OUTPUT_DIR/${exp}_results.json" \
         --num_frames 50000 \
-        --random_sample \
-        --no_latency &
+        --random_sample &
 
     pids+=($!)
 done
