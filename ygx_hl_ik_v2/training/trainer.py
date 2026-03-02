@@ -47,16 +47,12 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-
-# 尝试导入 transformers 的学习率调度器
-try:
-    from transformers import get_cosine_schedule_with_warmup
-    TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    TRANSFORMERS_AVAILABLE = False
-    print("警告: transformers 未安装，将使用自定义 Cosine LR。请运行: pip install transformers")
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingWarmRestarts, SequentialLR
 
 import wandb
+
+# 添加 core 目录到路径
+sys.path.insert(0, str(Path(__file__).parent.parent / 'core'))
 
 # 导入自定义模块
 from pim_ik_net import PiM_IK_Net, transform_to_9d
@@ -122,20 +118,26 @@ def parse_args():
     parser.add_argument('--window_size', type=int, default=30,
                         choices=[1, 15, 30],
                         help='时序窗口大小 (消融实验: 30=完整Mamba, 15=中等记忆, 1=无记忆基线)')
+    parser.add_argument('--train_stride', type=int, default=5,
+                        help='【抗过拟合】训练集滑动窗口步长，降低相邻样本重叠。验证集自动保持 stride=1 (默认 5)')
 
     # 训练相关
-    parser.add_argument('--epochs', type=int, default=6,
+    parser.add_argument('--epochs', type=int, default=50,
                         help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=512,
+    parser.add_argument('--batch_size', type=int, default=2048,
                         help='每卡批次大小')
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='初始学习率')
     parser.add_argument('--weight_decay', type=float, default=1e-4,
                         help='权重衰减 (L2 正则化)')
-    parser.add_argument('--warmup_epochs', type=int, default=5,
+    parser.add_argument('--warmup_epochs', type=int, default=2,
                         help='学习率预热轮数')
     parser.add_argument('--grad_clip', type=float, default=1.0,
                         help='梯度裁剪最大范数')
+    parser.add_argument('--t0', type=int, default=10,
+                        help='CosineAnnealingWarmRestarts 首次重启周期 (epochs)')
+    parser.add_argument('--t_mult', type=int, default=2,
+                        help='CosineAnnealingWarmRestarts 重启周期乘子')
 
     # 模型相关
     parser.add_argument('--d_model', type=int, default=256,
@@ -145,6 +147,8 @@ def parse_args():
     parser.add_argument('--backbone', type=str, default='mamba',
                         choices=['mamba', 'lstm', 'transformer'],
                         help='骨干网络类型 (消融实验: mamba/lstm/transformer)')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout 概率')
 
     # 保存与日志
     parser.add_argument('--save_dir', type=str, default='./checkpoints',
@@ -159,8 +163,15 @@ def parse_args():
                         help='拟人先验约束权重 L_swivel')
     parser.add_argument('--w_elbow', type=float, default=1.0,
                         help='三维空间约束权重 L_elbow')
-    parser.add_argument('--w_smooth', type=float, default=0.1,
+    parser.add_argument('--w_smooth', type=float, default=0.01,
                         help='时序平滑惩罚权重 L_smooth')
+    parser.add_argument('--elbow_loss_type', type=str, default='rmse',
+                        choices=['mse', 'rmse', 'l1'],
+                        help='肘部损失类型: mse(m²量级), rmse(m量级,推荐), l1(m量级)')
+
+    # 【抗过拟合】数据增强
+    parser.add_argument('--add_noise', action='store_true',
+                        help='【抗过拟合】在训练集 T_ee 上添加物理噪声（平移 2mm，旋转 0.005），打破坐标记忆')
 
     return parser.parse_args()
 
@@ -176,20 +187,27 @@ class SwivelSequenceDataset(Dataset):
     全量载入 .npz 数据到 CPU 内存，按滑动窗口切片返回样本。
     训练/验证集划分：前 95% 训练，后 5% 验证（不打乱，防止时序穿越）。
 
+    【抗过拟合】支持步长采样，避免相邻样本过度重叠：
+        - 训练集：使用 stride > 1，降低样本相关性（例如 stride=5，相邻样本仅 25 帧重叠）
+        - 验证集：保持 stride=1，确保评估的连续性和完整性
+
     Args:
         npz_path: .npz 数据文件路径
         window_size: 时间窗口大小（默认 30）
         train: True 为训练集，False 为验证集
+        stride: 滑动窗口步长（默认 1）。训练集建议使用 3-5，验证集必须使用 1
     """
 
     def __init__(
         self,
         npz_path: str,
         window_size: int = 30,
-        train: bool = True
+        train: bool = True,
+        stride: int = 1
     ):
         self.window_size = window_size
         self.train = train
+        self.stride = stride
 
         # ================================================================
         # 全量载入数据到 CPU 内存 (~5GB)
@@ -225,12 +243,17 @@ class SwivelSequenceDataset(Dataset):
             self.start_idx = train_split
             self.end_idx = self.total_frames
 
-        # 可用样本数 = 总帧数 - 窗口大小 + 1
-        self.num_samples = self.end_idx - self.start_idx - window_size + 1
+        # ================================================================
+        # 【抗过拟合】样本数计算：考虑步长
+        # ================================================================
+        # 可用样本数 = floor(可用帧数 - 窗口大小) / stride + 1
+        available_frames = self.end_idx - self.start_idx - window_size
+        self.num_samples = available_frames // self.stride + 1
 
         if dist.get_rank() == 0:
             split_name = "训练集" if train else "验证集"
-            print(f"[Dataset] {split_name}: {self.num_samples:,} 样本 (帧 {self.start_idx} - {self.end_idx})")
+            stride_info = f", stride={self.stride}" if self.stride > 1 else ""
+            print(f"[Dataset] {split_name}: {self.num_samples:,} 样本 (帧 {self.start_idx} - {self.end_idx}{stride_info})")
 
     def __len__(self) -> int:
         return self.num_samples
@@ -253,8 +276,10 @@ class SwivelSequenceDataset(Dataset):
                 - L_lower: (W,) 前臂长度
                 - is_valid: (W,) 有效性掩码
         """
-        # 计算实际起始帧索引
-        start_frame = self.start_idx + idx
+        # ================================================================
+        # 【抗过拟合】按步长计算实际起始帧索引
+        # ================================================================
+        start_frame = self.start_idx + idx * self.stride
         end_frame = start_frame + self.window_size
 
         # 提取窗口数据（已在 __init__ 中转换为 float32）
@@ -317,7 +342,9 @@ def train_one_epoch(
     loss_fn: PhysicsInformedLoss,
     device: torch.device,
     local_rank: int,
-    epoch: int
+    epoch: int,
+    use_wandb: bool = True,
+    add_noise: bool = False
 ) -> Dict[str, float]:
     """
     训练一个 Epoch
@@ -331,6 +358,8 @@ def train_one_epoch(
         device: 设备
         local_rank: 本地 rank
         epoch: 当前 epoch
+        use_wandb: 是否使用 WandB 日志
+        add_noise: 是否添加物理噪声（抗过拟合）
 
     Returns:
         avg_metrics: 平均损失指标字典
@@ -355,6 +384,17 @@ def train_one_epoch(
         L_upper = batch['L_upper'].to(device)     # (B, W)
         L_lower = batch['L_lower'].to(device)     # (B, W)
         is_valid = batch['is_valid'].to(device)   # (B, W)
+
+        # ================================================================
+        # 【抗过拟合】物理噪声数据增强
+        # ================================================================
+        if add_noise:
+            # 平移部分添加高斯噪声 N(0, 0.002^2)，约 2mm 标准差
+            T_ee[:, :, :3, 3] += torch.randn_like(T_ee[:, :, :3, 3]) * 0.002
+
+            # 旋转矩阵（3x3 部分）添加极微弱高斯噪声 N(0, 0.005^2)
+            # 只扰动前两列，保持旋转矩阵连续性
+            T_ee[:, :, :3, :2] += torch.randn_like(T_ee[:, :, :3, :2]) * 0.005
 
         # ================================================================
         # 前向传播
@@ -395,7 +435,7 @@ def train_one_epoch(
         num_batches += 1
 
         # WandB 日志（仅 Rank 0，每 100 步记录一次）
-        if local_rank == 0 and batch_idx % 100 == 0:
+        if use_wandb and local_rank == 0 and batch_idx % 100 == 0:
             current_lr = scheduler.get_last_lr()[0]
             wandb.log({
                 'train/loss_step': loss_dict['total_loss'],
@@ -500,53 +540,8 @@ def validate(
 
 
 # ============================================================================
-# 自定义学习率调度器（当 transformers 不可用时使用）
+# DDP 环境初始化与销毁
 # ============================================================================
-
-class CosineScheduleWithWarmup:
-    """
-    自定义余弦退火学习率调度器（带预热）
-
-    当 transformers 库不可用时使用此替代实现。
-    """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        num_warmup_steps: int,
-        num_training_steps: int,
-        min_lr_ratio: float = 0.0
-    ):
-        self.optimizer = optimizer
-        self.num_warmup_steps = num_warmup_steps
-        self.num_training_steps = num_training_steps
-        self.min_lr_ratio = min_lr_ratio
-        self.current_step = 0
-
-    def step(self):
-        """更新学习率"""
-        self.current_step += 1
-        lr = self.get_lr()
-        for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
-
-    def get_lr(self) -> float:
-        """计算当前学习率"""
-        if self.current_step < self.num_warmup_steps:
-            # 预热阶段：线性增加
-            return self.optimizer.defaults['lr'] * (self.current_step / self.num_warmup_steps)
-        else:
-            # 余弦退火阶段
-            progress = (self.current_step - self.num_warmup_steps) / \
-                       (self.num_training_steps - self.num_warmup_steps)
-            cosine_factor = 0.5 * (1 + np.cos(np.pi * progress))
-            return self.optimizer.defaults['lr'] * (
-                self.min_lr_ratio + (1 - self.min_lr_ratio) * cosine_factor
-            )
-
-    def get_last_lr(self) -> list:
-        """返回当前学习率（兼容 transformers API）"""
-        return [self.get_lr()]
 
 
 # ============================================================================
@@ -566,6 +561,8 @@ def main():
         # 数据
         'data_path': args.data_path,
         'window_size': args.window_size,
+        'train_stride': args.train_stride,  # 【抗过拟合】训练集步长
+        'add_noise': args.add_noise,         # 【抗过拟合】物理噪声增强
 
         # 训练
         'batch_size': args.batch_size,
@@ -574,16 +571,20 @@ def main():
         'weight_decay': args.weight_decay,
         'warmup_epochs': args.warmup_epochs,
         'grad_clip': args.grad_clip,
+        't0': args.t0,
+        't_mult': args.t_mult,
 
         # 模型
         'd_model': args.d_model,
         'num_layers': args.num_layers,
         'backbone': args.backbone,
+        'dropout': args.dropout,
 
         # 损失函数权重
         'w_swivel': args.w_swivel,
         'w_elbow': args.w_elbow,
         'w_smooth': args.w_smooth,
+        'elbow_loss_type': args.elbow_loss_type,
 
         # 保存
         'save_dir': args.save_dir,
@@ -636,13 +637,15 @@ def main():
     train_dataset = SwivelSequenceDataset(
         npz_path=CONFIG['data_path'],
         window_size=CONFIG['window_size'],
-        train=True
+        train=True,
+        stride=CONFIG.get('train_stride', 5)  # 训练集使用步长采样
     )
 
     val_dataset = SwivelSequenceDataset(
         npz_path=CONFIG['data_path'],
         window_size=CONFIG['window_size'],
-        train=False
+        train=False,
+        stride=1  # 验证集必须保持 stride=1，确保评估连续性
     )
 
     # 分布式采样器
@@ -693,7 +696,8 @@ def main():
     model = PiM_IK_Net(
         d_model=CONFIG['d_model'],
         num_layers=CONFIG['num_layers'],
-        backbone_type=CONFIG['backbone']
+        backbone_type=CONFIG['backbone'],
+        dropout=CONFIG['dropout']
     ).to(device)
 
     # DDP 包装
@@ -713,28 +717,38 @@ def main():
         weight_decay=CONFIG['weight_decay']
     )
 
-    # 学习率调度器
-    total_steps = len(train_loader) * CONFIG['epochs']
+    # 学习率调度器: 带重启的余弦退火
     warmup_steps = len(train_loader) * CONFIG['warmup_epochs']
+    t0_steps = len(train_loader) * CONFIG['t0']
 
-    if TRANSFORMERS_AVAILABLE:
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
-        )
-    else:
-        scheduler = CosineScheduleWithWarmup(
-            optimizer,
-            num_warmup_steps=warmup_steps,
-            num_training_steps=total_steps
-        )
+    # 1. 预热调度器 (从极其微小的 lr 线性增加到初始 lr)
+    warmup_scheduler = LinearLR(
+        optimizer,
+        start_factor=0.01,
+        total_iters=warmup_steps
+    )
+
+    # 2. 重启余弦调度器
+    cosine_restarts_scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=t0_steps,
+        T_mult=CONFIG['t_mult'],
+        eta_min=1e-6
+    )
+
+    # 3. 组合调度器
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_restarts_scheduler],
+        milestones=[warmup_steps]
+    )
 
     # 损失函数 (使用命令行参数配置权重)
     loss_fn = PhysicsInformedLoss(
         w_swivel=CONFIG['w_swivel'],
         w_elbow=CONFIG['w_elbow'],
-        w_smooth=CONFIG['w_smooth']
+        w_smooth=CONFIG['w_smooth'],
+        elbow_loss_type=CONFIG['elbow_loss_type']
     ).to(device)
 
     # ================================================================
@@ -743,12 +757,12 @@ def main():
     if local_rank == 0:
         print(f"\n{'='*60}")
         print(f"[Train] 开始训练: {CONFIG['epochs']} epochs")
-        print(f"[Train] 策略: 最佳模型保存 + 每3轮无改善时强制保存")
+        print(f"[Train] 策略: 最佳模型保存 + 每10轮无改善时强制保存")
         print(f"{'='*60}\n")
 
     best_val_loss = float('inf')
     epochs_without_improvement = 0  # 记录连续无改善的轮数
-    SAVE_INTERVAL = 3  # 每3轮无改善时强制保存
+    SAVE_INTERVAL = 10  # 每10轮无改善时强制保存
 
     for epoch in range(CONFIG['epochs']):
         # 设置 sampler 的 epoch（确保每个 epoch 的 shuffle 不同）
@@ -765,7 +779,9 @@ def main():
             loss_fn=loss_fn,
             device=device,
             local_rank=local_rank,
-            epoch=epoch
+            epoch=epoch,
+            use_wandb=not args.no_wandb,
+            add_noise=CONFIG['add_noise']  # 【抗过拟合】物理噪声增强
         )
 
         # ============================================================
@@ -822,7 +838,8 @@ def main():
                     'loss_weights': {
                         'w_swivel': args.w_swivel,
                         'w_elbow': args.w_elbow,
-                        'w_smooth': args.w_smooth
+                        'w_smooth': args.w_smooth,
+                        'elbow_loss_type': args.elbow_loss_type
                     },
                     'args': vars(args)
                 }, save_path)
@@ -841,7 +858,7 @@ def main():
                 # 无改善：计数+1
                 epochs_without_improvement += 1
 
-                # 每3轮无改善时强制保存一次
+                # 每10轮无改善时强制保存一次
                 if epochs_without_improvement >= SAVE_INTERVAL:
                     checkpoint_name = f'checkpoint_epoch{epoch+1}_{args.backbone}_L{args.num_layers}_w{args.window_size}_{loss_tag}.pth'
                     save_checkpoint(checkpoint_name, is_best=False)

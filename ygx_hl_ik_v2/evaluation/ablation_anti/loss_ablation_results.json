@@ -1,0 +1,61 @@
+{
+  "_metadata": {
+    "experiment": "loss_ablation",
+    "dataset": "GRAB",
+    "dataset_path": "/data0/wwb_data/ygx_data/data_ygx_pose+dof/GRAB_training_data_with_swivel.npz",
+    "ik_type": "approx",
+    "timestamp": "2026-03-02T19:11:32",
+    "num_frames": 49986,
+    "device": "cuda:0"
+  },
+  "results": {
+    "swivel_only": {
+      "params_k": 1985.666,
+      "network_latency_ms": -1.0,
+      "network_latency_p95_ms": -1.0,
+      "ik_latency_ms": -1.0,
+      "ik_latency_p95_ms": -1.0,
+      "latency_ms": -1.0,
+      "latency_p95_ms": -1.0,
+      "swivel_mae": 5.926074028015137,
+      "elbow_error_mm": 13.165658212708168,
+      "jerk": 3.3008737564086914,
+      "joint_mae": 4.388552737569389,
+      "window_size": 15,
+      "epoch": 23,
+      "val_loss": 0.18313926458358765
+    },
+    "elbow_only": {
+      "params_k": 1985.666,
+      "network_latency_ms": -1.0,
+      "network_latency_p95_ms": -1.0,
+      "ik_latency_ms": -1.0,
+      "ik_latency_p95_ms": -1.0,
+      "latency_ms": -1.0,
+      "latency_p95_ms": -1.0,
+      "swivel_mae": 5.747260570526123,
+      "elbow_error_mm": 12.325682094334883,
+      "jerk": 6.558839797973633,
+      "joint_mae": 4.108560698111627,
+      "window_size": 15,
+      "epoch": 29,
+      "val_loss": 0.016023848205804825
+    },
+    "full_loss": {
+      "params_k": 1985.666,
+      "network_latency_ms": -1.0,
+      "network_latency_p95_ms": -1.0,
+      "ik_latency_ms": -1.0,
+      "ik_latency_p95_ms": -1.0,
+      "latency_ms": -1.0,
+      "latency_p95_ms": -1.0,
+      "swivel_mae": 5.816961288452148,
+      "elbow_error_mm": 12.739206675680233,
+      "jerk": 5.818840980529785,
+      "joint_mae": 4.246402225226745,
+      "window_size": 15,
+      "epoch": 45,
+      "val_loss": 0.20075565576553345
+    }
+  }
+}

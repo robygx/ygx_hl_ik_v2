@@ -158,6 +158,7 @@ class PiM_IK_Net(nn.Module):
         d_conv: Mamba 卷积核大小（默认 4）
         expand: Mamba 扩展因子（默认 2）
         backbone_type: 骨干网络类型，可选 'mamba'/'lstm'/'transformer'（默认 'mamba'）
+        dropout: Dropout 概率（默认 0.1）
     """
 
     def __init__(
@@ -168,12 +169,22 @@ class PiM_IK_Net(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         backbone_type: str = 'mamba',
+        dropout: float = 0.1,
     ):
         super().__init__()
 
         self.d_model = d_model
         self.num_layers = num_layers
         self.backbone_type = backbone_type
+        self.dropout = dropout
+
+        # ================================================================
+        # 【抗过拟合】多级 Dropout 模块
+        # ================================================================
+        # Dropout: 用于 Backbone 和 Head（全连接层）
+        self.dropout_layer = nn.Dropout(dropout)
+        # Dropout1d: 用于 Stem（Conv1d 后的时序特征）
+        self.dropout1d = nn.Dropout1d(dropout)
 
         # ================================================================
         # 1. Stem: 浅层特征映射
@@ -247,6 +258,7 @@ class PiM_IK_Net(nn.Module):
         self.head = nn.Sequential(
             nn.Linear(d_model, 128),
             nn.GELU(),
+            nn.Dropout(p=dropout),  # 正则化：防止过拟合
             nn.Linear(128, 2)  # 输出 [cos(φ), sin(φ)]
         )
 
@@ -302,6 +314,12 @@ class PiM_IK_Net(nn.Module):
             # GELU 激活
             x = self.stem_act(x)     # (B, W, d_model)
 
+            # 【抗过拟合】Stem 级 Dropout（在 channel 维度）
+            # 先转为 (B, C, W) 格式应用 Dropout1d，再转回
+            x = x.permute(0, 2, 1)   # (B, d_model, W)
+            x = self.dropout1d(x)    # (B, d_model, W)
+            x = x.permute(0, 2, 1)   # (B, W, d_model)
+
             # ============================================================
             # Step 3: Backbone - 根据 backbone_type 路由
             # ============================================================
@@ -309,6 +327,8 @@ class PiM_IK_Net(nn.Module):
                 # Mamba 堆叠
                 for mamba_block in self.mamba_blocks:
                     x = mamba_block(x)   # (B, W, d_model) with residual
+                    # 【抗过拟合】Backbone 级 Dropout（每层 Mamba 后）
+                    x = self.dropout_layer(x)
 
             elif self.backbone_type == 'lstm':
                 # 单向 LSTM (因果性保证)
@@ -360,9 +380,15 @@ class PiM_IK_Net(nn.Module):
         x = x.permute(0, 2, 1)
         x = self.stem_act(x)
 
+        # 【抗过拟合】Stem 级 Dropout
+        x = x.permute(0, 2, 1)
+        x = self.dropout1d(x)
+        x = x.permute(0, 2, 1)
+
         # Backbone
         for mamba_block in self.mamba_blocks:
             x = mamba_block(x)
+            x = self.dropout_layer(x)  # 【抗过拟合】Backbone 级 Dropout
 
         # Output Head - 全时间窗口解码
         out = self.head(x)  # (B, W, 2)
