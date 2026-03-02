@@ -166,7 +166,7 @@ class PhysicsInformedLoss(nn.Module):
 
     包含三个子损失的加权组合：
     1. L_swivel: 拟人先验约束 - pred_swivel 与 gt_swivel 的 L1 误差
-    2. L_elbow: 三维空间物理约束 - 预测肘部与真实肘部的 MSE 误差
+    2. L_elbow: 三维空间物理约束 - 预测肘部与真实肘部的误差 (支持 MSE/RMSE/L1)
     3. L_smooth: 二阶平滑惩罚 - 惩罚时间维度上的加加速度 (Jerk)
 
     所有损失在计算均值前会乘以 is_valid mask，屏蔽奇异点。
@@ -175,18 +175,28 @@ class PhysicsInformedLoss(nn.Module):
         w_swivel: 拟人先验约束权重 (默认 1.0)
         w_elbow: 三维空间约束权重 (默认 1.0)
         w_smooth: 平滑惩罚权重 (默认 0.1)
+        elbow_loss_type: 肘部损失类型 ('mse', 'rmse', 'l1')，默认 'rmse'
+            - 'mse': MSE 损失，单位 m²，量级 ~0.0001
+            - 'rmse': RMSE 损失，单位 m，量级 ~0.01 (推荐)
+            - 'l1': L1 损失，单位 m，量级 ~0.01
     """
 
     def __init__(
         self,
         w_swivel: float = 1.0,
         w_elbow: float = 1.0,
-        w_smooth: float = 0.1
+        w_smooth: float = 0.1,
+        elbow_loss_type: str = 'rmse'  # 新增：肘部损失类型
     ):
         super().__init__()
         self.w_swivel = w_swivel
         self.w_elbow = w_elbow
         self.w_smooth = w_smooth
+        self.elbow_loss_type = elbow_loss_type.lower()
+
+        # 验证 elbow_loss_type
+        assert self.elbow_loss_type in ['mse', 'rmse', 'l1'], \
+            f"elbow_loss_type 必须是 'mse', 'rmse' 或 'l1'，当前: {self.elbow_loss_type}"
 
         # 实例化可微运动学层（用于计算 L_elbow）
         self.kinematics_layer = DifferentiableKinematicsLayer()
@@ -241,17 +251,29 @@ class PhysicsInformedLoss(nn.Module):
         L_swivel = (swivel_l1 * valid_mask).sum() / num_valid
 
         # ============================================================
-        # 损失 2: 三维空间物理约束 L_elbow (MSE 误差)
+        # 损失 2: 三维空间物理约束 L_elbow (支持 MSE/RMSE/L1)
         # ============================================================
         # 通过可微运动学层计算预测肘部坐标
         p_e_pred = self.kinematics_layer(pred_swivel, p_s, p_w, L_upper, L_lower)  # (B, W, 3)
 
-        # MSE 误差
-        elbow_sq_err = (p_e_pred - p_e_gt) ** 2  # (B, W, 3)
-        elbow_sq_err = elbow_sq_err.sum(dim=-1)  # (B, W) 每个时间步的平方误差
-
-        # 乘以 mask 后取均值
-        L_elbow = (elbow_sq_err * valid_mask).sum() / num_valid
+        # 根据 elbow_loss_type 计算肘部损失
+        if self.elbow_loss_type == 'mse':
+            # MSE 误差 (单位: m², 量级 ~0.0001)
+            elbow_err = (p_e_pred - p_e_gt) ** 2  # (B, W, 3)
+            elbow_err = elbow_err.sum(dim=-1)  # (B, W) 每个时间步的平方误差
+            L_elbow = (elbow_err * valid_mask).sum() / num_valid
+        elif self.elbow_loss_type == 'rmse':
+            # RMSE 误差 (单位: m, 量级 ~0.01)
+            # 先计算每个样本的 MSE，再开方
+            elbow_sq_err = (p_e_pred - p_e_gt) ** 2  # (B, W, 3)
+            elbow_sq_err = elbow_sq_err.sum(dim=-1)  # (B, W) 每个时间步的平方误差
+            elbow_rmse = torch.sqrt(elbow_sq_err + 1e-8)  # (B, W) 数值稳定的开方
+            L_elbow = (elbow_rmse * valid_mask).sum() / num_valid
+        else:  # 'l1'
+            # L1 误差 (单位: m, 量级 ~0.01)
+            elbow_l1 = torch.abs(p_e_pred - p_e_gt)  # (B, W, 3)
+            elbow_l1 = elbow_l1.sum(dim=-1)  # (B, W) 每个时间步的 L1 误差
+            L_elbow = (elbow_l1 * valid_mask).sum() / num_valid
 
         # ============================================================
         # 损失 3: 二阶平滑惩罚 L_smooth (Jerk)

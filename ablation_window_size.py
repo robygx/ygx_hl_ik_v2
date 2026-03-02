@@ -557,6 +557,17 @@ def main():
     swivel_aligned = swivel_traj[max_warmup:]  # 跳过预热期
     valid_aligned = valid_mask[max_warmup:]
 
+    # 【关键修复】对齐各模型的预测数据到相同长度
+    # 由于每个模型跳过的预热期不同，需要额外切片使它们长度一致
+    # pred_w30 已经跳过 29 帧，无需再切片
+    # pred_w15 跳过了 14 帧，需要再跳过 (29-14)=15 帧
+    # pred_w1 跳过了 0 帧，需要再跳过 (29-0)=29 帧
+    offset_w15 = max_warmup - warmup_w15  # 29 - 14 = 15
+    offset_w1 = max_warmup - warmup_w1    # 29 - 0 = 29
+
+    pred_w15 = pred_w15[offset_w15:]  # 跳过额外的帧
+    pred_w1 = pred_w1[offset_w1:]      # 跳过额外的帧
+
     print(f"  有效评估帧数: {len(swivel_aligned)}")
 
     # ================================================================
